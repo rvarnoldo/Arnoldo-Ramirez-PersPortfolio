@@ -1,0 +1,91 @@
+with PC_Invoices AS(
+--Create PC_Invoice Table to retreive Invoice Number and make it match with the Glap Table
+SELECT ldap.invoice_number
+    , ldap.ofa_org
+    , ldap.ofa_vendor_number
+--The following three is the convertion for the Unix timestam, which is an Int in the table
+    , TIMESTAMP 'epoch' + ldap.service_period_start_date/1000 * INTERVAL '1 second' AS service_period_start_date
+    , TIMESTAMP 'epoch' + ldap.service_period_end_date/1000 * INTERVAL '1 second' AS service_period_end_date
+    , TIMESTAMP 'epoch' + ldap.invoice_creation_date/1000 * INTERVAL '1 second' AS invoice_creation_date
+
+FROM invoices_table ldap
+
+--Bring Invoices with information available on service period on MX Retail organization
+WHERE ldap.service_period_end_date IS NOT NULL
+    AND ldap.ofa_org in ('MX_RETAIL')
+--Look for services with information between the past 6 months
+    AND (TIMESTAMP 'epoch' + ldap.service_period_end_date/1000 * INTERVAL '1 second') BETWEEN DATEADD('month',-6,DATE_TRUNC('month',to_date('{RUN_DATE_YYYYMMDD}','YYYYMMDD')+1)) and DATEADD('month',-1,DATE_TRUNC('month',to_date('{RUN_DATE_YYYYMMDD}','YYYYMMDD')+1))
+)
+
+-- OFA Table
+SELECT Glap.ledger_name
+       , Glap.company_code
+       , Glap.location_code
+       , Glap.cost_center
+       , Glap.account_number
+       , Glap.product_code
+       , Glap.channel_code
+       , Glap.project_code 
+--     , Glap.account_desc    This attribute it's not within GLAP schema
+       , Glap.journal_name
+       , Glap.vendor_name
+       , Glap.vendor_number       
+       , Glap.invoice_num
+       , Glap.invoice_date
+       , Glap.po_number
+       , Glap.po_requestor
+       , Glap.line_description    
+       , Glap.effective_date
+       , Glap.login1 AS CREATED_BY
+       , Glap.je_source
+       , Glap.je_category
+       , Glap.period_name
+       , Glap.functional_currency_code
+       , Glap.functional_amount AS amount
+       , PC_Invoices.service_period_start_date
+       , PC_Invoices.service_period_end_date
+
+       
+FROM finance_table Glap
+LEFT JOIN PC_Invoices
+	ON PC_Invoices.invoice_number = Glap.invoice_num
+    AND PC_Invoices.ofa_vendor_number = Glap.vendor_number
+       
+WHERE 1=1 -- cast(Glap.account_number as int) >= 57500 AND cast(Glap.account_number as int) <= 70000
+AND (
+	LEFT(glap.account_number,1) IN ('6')
+    OR account_number = '70000'
+    OR (
+    	LEFT(glap.account_number,3) NOT IN ('570')
+        AND LEFT(glap.account_number,2) IN ('57')
+    )
+)
+
+AND Glap.cost_center IN ('1055'
+                         ,'1041'
+                         ,'1057'
+                         ,'1065'
+                         ,'1092'
+                         ,'1093'
+                         ,'1151'
+                         ,'1153'
+                         ,'1166'
+                         ,'1168'
+                         ,'1169'
+                         ,'1171'
+                         ,'1172'
+                         ,'1173'
+                         ,'1174'
+                         ,'1175'
+                         ,'1176'
+                         ,'1182'
+                         ,'1184'
+                         ,'1234'
+                         ,'1294'
+                         ,'2580'
+                         ,'1310'
+                         ,'1384'
+                        ,'1705')
+AND to_date(Glap.period_name, 'MON-YY') BETWEEN DATEADD('month',-3,DATE_TRUNC('month',to_date('{RUN_DATE_YYYYMMDD}','YYYYMMDD'))) and DATEADD('month',-1,DATE_TRUNC('month',to_date('{RUN_DATE_YYYYMMDD}','YYYYMMDD')))
+AND Glap.ledger_name IN ('Amazon.mx')
+;
