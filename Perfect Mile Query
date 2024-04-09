@@ -1,0 +1,453 @@
+/*+ ETLM{
+  depend:{ add:[
+      { name:"Andes.PerfectMile.D_PERFECTMILE_PACKAGE_ITEMS_V2_NA" }
+      , { name:"Andes.PerfectMile.D_PERFECTMILE_PKG_ATTRIBUTES_V2_NA" }
+      , { name:"Andes.PerfectMile.D_PERFECTMILE_MON_DETAILS_NA" }
+      , { name:"Andes.BOOKER.D_UNIFIED_CUST_SHIPMENT_ITEMS" }
+]}}*/
+
+create temp table ITEM_DIM AS(
+    SELECT
+        pi.asin
+        , pi.pkg_length
+        , pi.pkg_width
+        , pi.pkg_height
+    	, pi.pkg_dimensional_uom
+        , pi.pkg_weight
+    	, pi.pkg_weight_uom
+    	, pi.marketplace_id
+    
+    	, CASE WHEN pi.pkg_length <= 18 AND pi.pkg_width <= 14 AND pi.pkg_height <= 8 AND pi.pkg_weight <= 20 THEN 'SORTABLE'
+			WHEN pi.pkg_length <= 32 AND pi.pkg_width <= 26 AND pi.pkg_height <= 20 AND pi.pkg_weight <= 40 THEN 'FULLCASE'
+         	WHEN pi.pkg_length > 32 OR pi.pkg_width > 26 OR pi.pkg_height > 20 OR pi.pkg_weight > 40 THEN 'NONCON'
+    	ELSE 'SORTABLE' END AS SORT_TYPE
+    
+    	-- from BITS DOSI logic: https://datacentral.a2z.com/dw-platform/servlet/dwp/template/EtlViewExtractJobs.vm/job_profile_id/4870615 300-322
+    	-- wiki: https://w.amazon.com/bin/view/Transportation/BITS/D_OUTBOUND_SHIPMENT_ITEMS/D_OUTBOUND_SHIP_ITEMS_Columns
+    	, case
+        when (pi.pkg_width is null or pi.pkg_width = 0 or pi.pkg_length is null or pi.pkg_length = 0
+            or pi.pkg_height is null or pi.pkg_height = 0 or pi.pkg_weight is null or pi.pkg_weight = 0
+            or pi.pkg_weight_uom is null or Lower(pi.pkg_weight_uom) != 'pounds'
+            or pi.pkg_dimensional_uom is null or Lower(pi.pkg_dimensional_uom) !='inches')
+        then 'UNKNOWN'
+        when (pi.pkg_width <= 14 and pi.pkg_length <= 18 and pi.pkg_height <= 8 and pi.pkg_weight <= 20 ) then
+            case when ( cast(pi.pkg_width as float) * cast(pi.pkg_height as float) * cast(pi.pkg_length as float) <= 80 and pi.pkg_weight <= 5) then 'SMALL'
+            else 'MEDIUM' end
+        else case
+            when ( cast(pi.pkg_width as float) * cast(pi.pkg_height as float) * cast(pi.pkg_length as float) < 18000 and pi.pkg_weight < 50 and pi.pkg_length < 108 )
+        then 'LARGE' else 'EXTRA_LARGE' end
+        end AS size_category
+    
+    FROM ANDES.BOOKER.D_MP_PHYSICAL_ITEMS pi
+
+    WHERE pi.REGION_ID in (1)
+    	AND pi.MARKETPLACE_ID in (771770,1)
+    	-- AND pi.is_deleted = 'N'
+);
+
+create temp table ducsi AS(
+    SELECT
+    	ducsi.ship_day
+        , ducsi.marketplace_id
+    	, ducsi.customer_shipment_item_id
+        , ducsi.customer_order_item_id
+        , ducsi.extended_allocated_ship_charge
+        , ducsi.ship_charge_discount_amt
+        , ducsi.inventory_owner_group_id
+
+    FROM Andes.BOOKER.D_UNIFIED_CUST_SHIPMENT_ITEMS ducsi
+    WHERE 1=1
+        and ducsi.region_id = 1
+        -- only adjust dates and keep intervals to ensure that the query is going to add extra attributes from additional ducsi table
+        and ducsi.ship_day BETWEEN date_trunc('month', TO_DATE('{RUN_DATE_YYYYMMDD}', 'YYYYMMDD')) - interval '3 month' AND TO_DATE('{RUN_DATE_YYYYMMDD}', 'YYYYMMDD') + INTERVAL '1 week'
+    	and ducsi.marketplace_id in (771770,1)
+);
+
+with final AS(
+SELECT
+    to_char(dppi.ducsi_ship_date, 'YYYY' ) as ship_year
+    , to_char(dppi.ducsi_ship_date, 'Q' ) as ship_quarter 
+    , to_char(dppi.ducsi_ship_date, 'MM' ) as ship_month
+    -- , to_char(dppi.ducsi_ship_date + 1 , 'IW') as ship_week
+    --, ord.reporting_week_of_year as ship_week
+    , dppi.ducsi_ship_date as ship_day
+
+    , dppi.marketplace_id
+    , dppi.legal_entity_id
+    
+	, dppi.is_prime as is_primeclub
+	
+    , coalesce( dsm.ship_carrier, split_part(dppi.ship_method, '_', 1) ) as scac
+    , pka.scac as pka_scac
+	, idim.size_category
+    
+	, substring(dppi.customer_ship_option,1,4) as ordering_ship_option
+	, substring(dppi.shipment_ship_option,1,4) as shipment_ship_option
+
+    , dppi.ordering_order_id as order_id
+	, dppi.fulfillment_shipment_id
+	, dppi.package_id
+	, dppi.tracking_id
+    
+	, dppi.quantity as units
+	, sum( dppi.quantity ) over ( partition by dppi.fulfillment_shipment_id ) as units_per_shipment
+    
+    -- , pka.package_scale_weight
+	, pka.package_scale_weight_uom as item_scale_weight_uom
+    , dppi.quantity * pka.package_scale_weight / sum( dppi.quantity ) over ( partition by dppi.fulfillment_shipment_id || dppi.package_id ) as item_scale_weight
+    
+    -- , pka.ship_cost as pka_ship_cost
+    , dppi.quantity * pka.ship_cost / sum( dppi.quantity ) over ( partition by dppi.fulfillment_shipment_id || dppi.package_id ) as item_ship_cost
+    , pka.ship_cost_uom as item_ship_cost_uom
+    
+	--, idim.pkg_weight as item_scale_weight
+	--, idim.pkg_weight_uom as item_scale_weight_uom
+    
+    , ducsi.extended_allocated_ship_charge as ship_revenue
+    , ducsi.ship_charge_discount_amt as ship_charge_discount
+    , dppi.weight_alloc_ship_cost as ship_cost
+
+    , coalesce(pka.destination_postal_code, da.postal_code) as zip_code
+	, case
+    WHEN substring(coalesce(pka.destination_postal_code, da.postal_code),1,2) in ('28','36','37','38','42','43','44','45','46','47','48','49','58','59','60'
+                                                                                 ,'61','62','63','72','73','74','75','76','90') then 'Central'
+    WHEN substring(coalesce(pka.destination_postal_code, da.postal_code),1,2) in ('01','02','03','04','05','06','07','08','09','10','11','12','13','14','15'
+                                                                                  ,'16','50','51','52','53','54','55','56','57') then 'Mexico-DF'
+    WHEN substring(coalesce(pka.destination_postal_code, da.postal_code),1,2) in ('20','25','26','27','64','65','66','67','78','79','87','88','89','98','99') then 'Northeast'
+    WHEN substring(coalesce(pka.destination_postal_code, da.postal_code),1,2) in ('21','22','23','31','32','33','34','35','80','81','82','83','84','85') then 'Northwest'
+    WHEN substring(coalesce(pka.destination_postal_code, da.postal_code),1,2) in ('24','29','30','39','40','41','68','69','70','71','77','86','91','92','93','94','95','96','97') then 'South'
+	ELSE substring(coalesce(pka.destination_postal_code, da.postal_code),1,2) END as region
+
+    , CASE WHEN SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN
+        ('00','01','02','03','04','05','06','07','08','09','10','11','12','13','14','15','16') THEN 'Distrito Federal'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('20') THEN 'Aguascalientes'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('21','22') THEN 'Baja California'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('23') THEN 'Baja California Sur'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('24') THEN 'Campeche'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('29','30') THEN 'Chiapas'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('31','32','33') THEN 'Chihuahua'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('25','26','27') THEN 'Coahuila'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('28') THEN 'Colima'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('34','35') THEN 'Durango'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('36','37','38') THEN 'Guanajuato'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('39','40','41') THEN 'Guerrero'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('42','43') THEN 'Hidalgo'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('44','45','46','47','48','49') THEN 'Jalisco'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('50','51','52','53','54','55','56','57') THEN 'Mexico'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('58','59','60','61') THEN 'Michoacan'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('62') THEN 'Morelos'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('63') THEN 'Nayarit'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('64','65','66','67') THEN 'Nuevo Leon'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('68','69','70','71') THEN 'Oaxaca'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('72','73','74','75') THEN 'Puebla'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('76') THEN 'Queretaro'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('77') THEN 'Quintana Roo'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('78','79') THEN 'San Luis Potosi'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('80','81','82') THEN 'Sinaloa'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('83','84','85') THEN 'Sonora'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('86') THEN 'Tabasco'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('87','88','89') THEN 'Tamaulipas'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('90') THEN 'Tlaxcala'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('91','92','93','94','95','96') THEN 'Veracruz'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('97') THEN 'Yucatan'
+        when SUBSTRING(coalesce(pka.destination_postal_code, da.postal_code), 1, 2) IN ('98','99') THEN 'Zacatecas'
+    ELSE 'Unknown' END AS state
+    
+    , dppi.carrier_sort_code as sort_code
+    , case when fcs.org = 'MX' then dppi.warehouse_id else 'US FC' end as fc
+    
+    , case when fcs.org = 'MX' then 'Domestic'
+    	when fcs.org = 'US' then 'Global'
+    else 'Other' end as volume_origin
+    
+	, case
+    	WHEN fcs.org = 'MX' and (fcs.node_type ilike 'fc' or dppi.warehouse_id in ('VMEX','VMX4')) and ducsi.inventory_owner_group_id in (369991) then 'MX_Retail_Domestic'
+    	WHEN fcs.org = 'MX' and (fcs.node_type ilike 'fc' or dppi.warehouse_id in ('VMEX','VMX4')) and ducsi.inventory_owner_group_id in (453340) then 'Direct_Imports'
+	    WHEN fcs.org = 'MX' and (fcs.node_type ilike 'fc' or dppi.warehouse_id in ('VMEX','VMX4')) and ducsi.inventory_owner_group_id in (1) then 'NAFN'
+    	WHEN fcs.org = 'MX' and (fcs.node_type ilike 'fc' or dppi.warehouse_id in ('VMEX','VMX4')) and ducsi.inventory_owner_group_id not in (1,369991,453340) then 'FBA'
+    	WHEN fcs.org = 'MX' and dppi.warehouse_id ilike 'S%' THEN 'Domestic Seller Flex'
+    	WHEN fcs.org = 'MX' and dppi.warehouse_id ilike 'V%' THEN 'Domestic Vendor Flex'
+    	WHEN fcs.org = 'US' and dppi.marketplace_id IN ('771770') and dppi.is_retail_merchant = 'N' THEN 'NARF'
+    	WHEN fcs.org = 'US' and dppi.marketplace_id IN ('771770') and dppi.is_retail_merchant = 'Y' THEN 'Global_Store'
+    	WHEN fcs.org = 'US' and dppi.marketplace_id IN ('1') THEN 'Core_Exports'
+	ELSE 'Other' END AS iog
+
+    , dppi.gl_product_group as GL_Number
+	, Case
+        When dppi.gl_product_group in (14) then 'Media'
+        When dppi.gl_product_group in (15) then 'Media'
+        When dppi.gl_product_group in (20) then 'Unknown'
+        When dppi.gl_product_group in (21) then 'Hardlines'
+        When dppi.gl_product_group in (22) then 'Unknown'
+        When dppi.gl_product_group in (23) then 'Hardlines'
+        When dppi.gl_product_group in (27) then 'Media'
+        When dppi.gl_product_group in (60) then 'Hardlines'
+        When dppi.gl_product_group in (63) then 'Media'
+        When dppi.gl_product_group in (65) then 'Softlines'
+        When dppi.gl_product_group in (74) then 'Media'
+        When dppi.gl_product_group in (75) then 'Consumables'
+        When dppi.gl_product_group in (86) then 'Hardlines'
+        When dppi.gl_product_group in (107) then 'Hardlines'
+        When dppi.gl_product_group in (111) then 'Digital'
+        When dppi.gl_product_group in (121) then 'Consumables'
+        When dppi.gl_product_group in (129) then 'Unknown'
+        When dppi.gl_product_group in (136) then 'Unknown'
+        When dppi.gl_product_group in (147) then 'Hardlines'
+        When dppi.gl_product_group in (153) then 'Unknown'
+        When dppi.gl_product_group in (158) then 'Unknown'
+        When dppi.gl_product_group in (160) then 'Unknown'
+        When dppi.gl_product_group in (193) then 'Softlines'
+        When dppi.gl_product_group in (194) then 'Consumables'
+        When dppi.gl_product_group in (195) then 'Consumables'
+        When dppi.gl_product_group in (196) then 'Hardlines'
+        When dppi.gl_product_group in (197) then 'Softlines'
+        When dppi.gl_product_group in (198) then 'Softlines'
+        When dppi.gl_product_group in (79) then 'Hardlines'
+        When dppi.gl_product_group in (200) then 'Hardlines'
+        When dppi.gl_product_group in (228) then 'Unknown'
+        When dppi.gl_product_group in (229) then 'Hardlines'
+        When dppi.gl_product_group in (236) then 'Unknown'
+        When dppi.gl_product_group in (241) then 'Softlines'
+        When dppi.gl_product_group in (246) then 'Softlines'
+        When dppi.gl_product_group in (251) then 'Consumables'
+        When dppi.gl_product_group in (263) then 'Hardlines'
+        When dppi.gl_product_group in (264) then 'Unknown'
+        When dppi.gl_product_group in (267) then 'Hardlines'
+        When dppi.gl_product_group in (279) then 'Unknown'
+        When dppi.gl_product_group in (309) then 'Softlines'
+        When dppi.gl_product_group in (311) then 'Unknown'
+        When dppi.gl_product_group in (325) then 'Consumables'
+        When dppi.gl_product_group in (349) then 'Digital'
+        When dppi.gl_product_group in (364) then 'Consumables'
+        When dppi.gl_product_group in (328) then 'Hardlines'
+        When dppi.gl_product_group in (293) then 'Hardlines'
+        When dppi.gl_product_group in (400) then 'Digital'
+        When dppi.gl_product_group in (265) then 'Hardlines'
+        When dppi.gl_product_group in (199) then 'Hardlines'
+        When dppi.gl_product_group in (201) then 'Hardlines'
+        When dppi.gl_product_group in (421) then 'Hardlines'
+        When dppi.gl_product_group in (422) then 'Hardlines'
+        When dppi.gl_product_group in (424) then 'Digital'
+        When dppi.gl_product_group in (425) then 'Digital'
+        When dppi.gl_product_group in (467) then 'Consumables'
+        When dppi.gl_product_group in (465) then 'Digital'
+        When dppi.gl_product_group in (470) then 'Digital'
+        When dppi.gl_product_group in (468) then 'Hardlines'
+        When dppi.gl_product_group in (469) then 'Hardlines'
+        When dppi.gl_product_group in (259) then 'Hardlines'
+        When dppi.gl_product_group in (441) then 'Hardlines'
+        When dppi.gl_product_group in (261) then 'Hardlines'
+        When dppi.gl_product_group in (336) then 'Unknown'
+        When dppi.gl_product_group in (493) then 'Digital'
+        When dppi.gl_product_group in (494) then 'Digital'
+        When dppi.gl_product_group in (504) then 'Hardlines'
+        When dppi.gl_product_group in (641) then 'Softlines'
+        When dppi.gl_product_group in (370) then 'Consumables'
+        When dppi.gl_product_group in (510) then 'Consumables'
+        When dppi.gl_product_group in (451) then 'Digital'
+        When dppi.gl_product_group in (353) then 'Hardlines'
+    Else 'Unknown' End AS GL_Family
+
+    , Case
+        When dppi.gl_product_group in (14) then 'Books'
+        When dppi.gl_product_group in (15) then 'Music'
+        When dppi.gl_product_group in (20) then 'Gift'
+        When dppi.gl_product_group in (21) then 'Toys'
+        When dppi.gl_product_group in (22) then 'Games'
+        When dppi.gl_product_group in (23) then 'Electronics'
+        When dppi.gl_product_group in (27) then 'Video'
+        When dppi.gl_product_group in (60) then 'Home Improvement'
+        When dppi.gl_product_group in (63) then 'Video Games'
+        When dppi.gl_product_group in (65) then 'Software'
+        When dppi.gl_product_group in (74) then 'DVD'
+        When dppi.gl_product_group in (75) then 'Baby'
+        When dppi.gl_product_group in (86) then 'Lawn and Garden'
+        When dppi.gl_product_group in (107) then 'Wireless'
+        When dppi.gl_product_group in (111) then 'EBooks'
+        When dppi.gl_product_group in (121) then 'Health & Personal Care'
+        When dppi.gl_product_group in (129) then 'Audible'
+        When dppi.gl_product_group in (136) then 'Downloadable Software'
+        When dppi.gl_product_group in (147) then 'PC'
+        When dppi.gl_product_group in (153) then 'Magazine'
+        When dppi.gl_product_group in (158) then 'Target'
+        When dppi.gl_product_group in (160) then 'Target Gift Card'
+        When dppi.gl_product_group in (193) then 'Apparel'
+        When dppi.gl_product_group in (194) then 'Beauty'
+        When dppi.gl_product_group in (195) then 'Food and Beverage'
+        When dppi.gl_product_group in (196) then 'Furniture'
+        When dppi.gl_product_group in (197) then 'Jewelry'
+        When dppi.gl_product_group in (198) then 'Luggage'
+        When dppi.gl_product_group in (79) then 'Kitchen'
+        When dppi.gl_product_group in (200) then 'Sports'
+        When dppi.gl_product_group in (228) then 'Gift Card'
+        When dppi.gl_product_group in (229) then 'Office Supplies'
+        When dppi.gl_product_group in (236) then 'SDP Misc'
+        When dppi.gl_product_group in (241) then 'Watch'
+        When dppi.gl_product_group in (246) then 'Loose Stones'
+        When dppi.gl_product_group in (251) then 'Gourmet'
+        When dppi.gl_product_group in (263) then 'Automotive'
+        When dppi.gl_product_group in (264) then 'Art'
+        When dppi.gl_product_group in (267) then 'Musical  Instruments'
+        When dppi.gl_product_group in (279) then 'Gift Certificates'
+        When dppi.gl_product_group in (309) then 'Shoes'
+        When dppi.gl_product_group in (311) then 'Free Gift Card'
+        When dppi.gl_product_group in (325) then 'Grocery'
+        When dppi.gl_product_group in (349) then 'Digital Text'
+        When dppi.gl_product_group in (364) then 'Personal Care Appliances'
+        When dppi.gl_product_group in (328) then 'BISS'
+        When dppi.gl_product_group in (293) then 'Tires'
+        When dppi.gl_product_group in (400) then 'Digital Device Accessories'
+        When dppi.gl_product_group in (265) then 'Major Appliances'
+        When dppi.gl_product_group in (199) then 'Pets'
+        When dppi.gl_product_group in (201) then 'Home'
+        When dppi.gl_product_group in (421) then 'Camera'
+        When dppi.gl_product_group in (422) then 'Mobile Electronics'
+        When dppi.gl_product_group in (424) then 'LCD Devices'
+        When dppi.gl_product_group in (425) then 'LCD Accessories'
+        When dppi.gl_product_group in (467) then 'Amazon Pantry'
+        When dppi.gl_product_group in (465) then 'Fire TV'
+        When dppi.gl_product_group in (470) then 'Fire TV Accessories'
+        When dppi.gl_product_group in (468) then 'Outdoor_Recreation'
+        When dppi.gl_product_group in (469) then 'Tools2'
+        When dppi.gl_product_group in (259) then 'Sports Memorabilia'
+        When dppi.gl_product_group in (441) then 'Entertainment Memorabilia'
+        When dppi.gl_product_group in (261) then 'Art and Craft Supplies'
+        When dppi.gl_product_group in (336) then 'Gift Certificates'
+        When dppi.gl_product_group in (493) then 'Fire Phone'
+        When dppi.gl_product_group in (494) then 'Fire Phone Accessories'
+        When dppi.gl_product_group in (504) then 'Home Entertainment'
+        When dppi.gl_product_group in (641) then 'Softlines Private Label'
+        When dppi.gl_product_group in (547) then 'Digital products 9 accessory'
+        When dppi.gl_product_group in (548) then 'Digital products 10 accessory'
+        When dppi.gl_product_group in (370) then 'Wine'
+        When dppi.gl_product_group in (517) then 'Guild'
+        When dppi.gl_product_group in (510) then 'Luxury Beauty'
+        When dppi.gl_product_group in (451) then 'Digital Products 3'
+        When dppi.gl_product_group in (485) then 'Digital Products 3 Accesory'
+        When dppi.gl_product_group in (353) then 'Wireless Accesory'
+    Else 'Unknown' End AS GL_Category
+    
+    -- new MON finance columns - https://w.amazon.com/bin/view/PerfectMile/VolumeAlignment_Nucleus/FinancialFieldsRemoval#HImpactandCustomerActions
+    , mon.weight_alloc_ship_cost as mon_ship_cost
+    --, mon.ship_cost_base_currency_code as mon_currency_code
+
+FROM Andes.PerfectMile.D_PERFECTMILE_PACKAGE_ITEMS_V2_NA dppi
+
+-- joining o_reporting dim table to get amazonian week number
+--JOIN ANDES.BOOKER.O_REPORTING_DAYS ord on ord.calendar_day::date = dppi.ducsi_ship_date::date
+
+-- joining ducsi for revenue, discount and cost related metrics
+LEFT JOIN ducsi
+	on  ducsi.customer_shipment_item_id = dppi.customer_shipment_item_id
+    and ducsi.customer_order_item_id = dppi.customer_order_item_id
+
+-- joining pka to get item weight values
+LEFT JOIN Andes.PerfectMile.D_PERFECTMILE_PKG_ATTRIBUTES_V2_NA pka
+    on  pka.fulfillment_shipment_id = dppi.fulfillment_shipment_id
+	and pka.package_id = dppi.package_id
+    and pka.region_id = 1
+    and pka.destination_country_code ilike 'MX'
+    and pka.ship_date BETWEEN date_trunc('month', TO_DATE('{RUN_DATE_YYYYMMDD}', 'YYYYMMDD')) - interval '3 month' AND TO_DATE('{RUN_DATE_YYYYMMDD}', 'YYYYMMDD') + INTERVAL '1 week'
+	AND pka.partition_date BETWEEN date_trunc('month', TO_DATE('{RUN_DATE_YYYYMMDD}', 'YYYYMMDD')) - interval '3 month' AND TO_DATE('{RUN_DATE_YYYYMMDD}', 'YYYYMMDD') + INTERVAL '1 week'
+    
+-- joining CIMS nodes to identify the volume type based on fc attributes
+LEFT JOIN Andes.CIMS_DATAWAREHOUSE_PROD.CIMS_DOMAIN_WAREHOUSE_INFO fcs 
+    on fcs.WAREHOUSE = DPPI.WAREHOUSE_ID
+
+-- joining addresses to get zip code details from address id
+LEFT JOIN ANDES.BOOKER.D_ADDRESSES da 
+    ON dppi.address_id = da.address_id
+
+-- joining ship_methods to get the carrier friendly name
+LEFT JOIN Andes.CSINSIGHT.DIM_SHIP_METHODS dsm 
+    on dsm.ship_method = dppi.ship_method
+
+-- joining item dimension from initial subquery to get item size and weight metrics
+LEFT JOIN ITEM_DIM idim on idim.asin = dppi.asin
+	and idim.marketplace_id = dppi.marketplace_id
+
+LEFT JOIN Andes.PerfectMile.D_PERFECTMILE_MON_DETAILS_NA mon
+    on dppi.customer_shipment_item_id = mon.customer_shipment_item_id
+    and dppi.fulfillment_shipment_id = mon.fulfillment_shipment_id
+    and dppi.package_id = mon.package_id
+    and dppi.legal_entity_id = mon.legal_entity_id
+    and mon.ship_day BETWEEN date_trunc('month', TO_DATE('{RUN_DATE_YYYYMMDD}', 'YYYYMMDD')) - interval '3 month' AND TO_DATE('{RUN_DATE_YYYYMMDD}', 'YYYYMMDD') + INTERVAL '1 week'
+    
+WHERE DPPI.region_id = 1
+    -- MX related volume filters
+    AND DPPI.destination_country_code ilike 'MX'
+    AND dppi.legal_entity_id in (133, 101)			-- 133 = mx / 101 = US
+    AND dppi.marketplace_id in (771770,1)	-- 771770 = .com.mx / 1 = .com
+    
+    -- adjusting ship dates
+    AND DPPI.ducsi_ship_date >= date_trunc('month', TO_DATE('{RUN_DATE_YYYYMMDD}', 'YYYYMMDD')) - interval '1 month'
+	AND DPPI.ducsi_ship_date <  date_trunc('month', TO_DATE('{RUN_DATE_YYYYMMDD}', 'YYYYMMDD'))
+    
+    -- excluding returns
+    AND DPPI.customer_ship_option NOT IN ('vendor-returns','customer-returns')
+    -- excluding MFN shipments
+    AND DPPI.warehouse_id NOT IN ('MDUS','PTOP')
+)
+
+select
+	ship_year
+    , ship_quarter
+    , ship_month
+    --, ship_week
+    --, ship_day
+	, is_primeclub
+    , scac
+    , fc
+	, size_category
+    
+	, ordering_ship_option
+	, shipment_ship_option
+    -- , count(distinct dppi.fulfillment_shipment_id || dppi.package_id) as shipments
+    , sum(units/units_per_shipment) as shipments
+	, sum(units) as units
+	, sum(item_scale_weight) as item_scale_weight
+	, item_scale_weight_uom
+
+	--, zip_code
+    , region
+    , state
+	
+    , volume_origin
+    , marketplace_id
+	, iog
+    , gl_number
+	, gl_family
+    , gl_category
+
+	, item_ship_cost_uom as ship_cost_uom
+    , sum(ship_revenue) as ship_revenue
+    , sum(ship_charge_discount) as ship_charge_discount
+    , sum(ship_cost) as ship_cost
+    
+    , sum(mon_ship_cost) as new_ship_cost
+
+from final
+          
+group by
+	ship_year
+    , ship_quarter
+    , ship_month
+    --, ship_week
+    --, ship_day
+	, is_primeclub
+    , scac
+	, size_category
+	, ordering_ship_option
+	, shipment_ship_option
+	, item_scale_weight_uom
+	--, zip_code
+    , region
+    , state
+    , marketplace_id
+	, iog
+    , gl_number
+	, gl_family
+    , gl_category
+    , fc
+    , volume_origin
+    , item_ship_cost_uom
